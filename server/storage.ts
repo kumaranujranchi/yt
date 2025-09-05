@@ -1,5 +1,8 @@
 import { type User, type InsertUser, type Download, type InsertDownload } from "@shared/schema";
-import { randomUUID } from "crypto";
+import { neon } from "@neondatabase/serverless";
+import { drizzle } from "drizzle-orm/neon-http";
+import { users, downloads } from "@shared/schema";
+import { eq, desc } from "drizzle-orm";
 
 export interface IStorage {
   getUser(id: string): Promise<User | undefined>;
@@ -13,14 +16,75 @@ export interface IStorage {
   deleteDownload(id: string): Promise<boolean>;
 }
 
-export class MemStorage implements IStorage {
-  private users: Map<string, User>;
-  private downloads: Map<string, Download>;
+class DatabaseStorage implements IStorage {
+  private db;
 
   constructor() {
-    this.users = new Map();
-    this.downloads = new Map();
+    const connectionString = process.env.DATABASE_URL || process.env.NEON_DATABASE_URL;
+    if (!connectionString) {
+      throw new Error("DATABASE_URL environment variable is required");
+    }
+    const sql = neon(connectionString);
+    this.db = drizzle(sql);
   }
+
+  async getUser(id: string): Promise<User | undefined> {
+    const result = await this.db.select().from(users).where(eq(users.id, id));
+    return result[0];
+  }
+
+  async getUserByUsername(username: string): Promise<User | undefined> {
+    const result = await this.db.select().from(users).where(eq(users.username, username));
+    return result[0];
+  }
+
+  async createUser(insertUser: InsertUser): Promise<User> {
+    const result = await this.db.insert(users).values(insertUser).returning();
+    return result[0];
+  }
+
+  async getDownloads(): Promise<Download[]> {
+    const result = await this.db.select().from(downloads).orderBy(desc(downloads.createdAt));
+    return result;
+  }
+
+  async getDownload(id: string): Promise<Download | undefined> {
+    const result = await this.db.select().from(downloads).where(eq(downloads.id, id));
+    return result[0];
+  }
+
+  async createDownload(insertDownload: InsertDownload): Promise<Download> {
+    const result = await this.db.insert(downloads).values({
+      ...insertDownload,
+      status: "pending",
+      progress: 0,
+      createdAt: new Date(),
+      completedAt: null,
+      fileSize: null,
+      downloadSpeed: null,
+      timeRemaining: null,
+    }).returning();
+    return result[0];
+  }
+
+  async updateDownload(id: string, updates: Partial<Download>): Promise<Download | undefined> {
+    const result = await this.db.update(downloads)
+      .set(updates)
+      .where(eq(downloads.id, id))
+      .returning();
+    return result[0];
+  }
+
+  async deleteDownload(id: string): Promise<boolean> {
+    const result = await this.db.delete(downloads).where(eq(downloads.id, id));
+    return result.rowCount > 0;
+  }
+}
+
+// Fallback to memory storage if database is not available
+class MemStorage implements IStorage {
+  private users: Map<string, User> = new Map();
+  private downloads: Map<string, Download> = new Map();
 
   async getUser(id: string): Promise<User | undefined> {
     return this.users.get(id);
@@ -33,7 +97,7 @@ export class MemStorage implements IStorage {
   }
 
   async createUser(insertUser: InsertUser): Promise<User> {
-    const id = randomUUID();
+    const id = crypto.randomUUID();
     const user: User = { ...insertUser, id };
     this.users.set(id, user);
     return user;
@@ -50,7 +114,7 @@ export class MemStorage implements IStorage {
   }
 
   async createDownload(insertDownload: InsertDownload): Promise<Download> {
-    const id = randomUUID();
+    const id = crypto.randomUUID();
     const download: Download = {
       ...insertDownload,
       id,
@@ -61,6 +125,10 @@ export class MemStorage implements IStorage {
       fileSize: null,
       downloadSpeed: null,
       timeRemaining: null,
+      thumbnail: insertDownload.thumbnail ?? null,
+      duration: insertDownload.duration ?? null,
+      channel: insertDownload.channel ?? null,
+      views: insertDownload.views ?? null,
     };
     this.downloads.set(id, download);
     return download;
@@ -80,4 +148,8 @@ export class MemStorage implements IStorage {
   }
 }
 
-export const storage = new MemStorage();
+// Force in-memory storage only (no database)
+const storageInstance: IStorage = new MemStorage();
+console.log("✅ Using in-memory storage (server-side only, no database)");
+
+export const storage = storageInstance;

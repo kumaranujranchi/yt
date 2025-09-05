@@ -49,7 +49,8 @@ export default function DownloadForm({ onVideoInfo, onDownloadStart }: DownloadF
       setUrlError("");
       return videoInfo;
     } catch (error) {
-      setUrlError("Failed to fetch video information");
+      const message = error instanceof Error ? error.message : "Failed to fetch video information";
+      setUrlError(message);
       throw error;
     }
   };
@@ -76,9 +77,10 @@ export default function DownloadForm({ onVideoInfo, onDownloadStart }: DownloadF
       form.reset();
     } catch (error) {
       console.error("Download error:", error);
+      const description = error instanceof Error ? error.message : "Failed to start download. Please check the URL and try again.";
       toast({
         title: "Download Failed",
-        description: "Failed to start download. Please check the URL and try again.",
+        description,
         variant: "destructive",
       });
     } finally {

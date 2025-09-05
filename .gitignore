@@ -4,3 +4,12 @@ dist
 server/public
 vite.config.ts.*
 *.tar.gz
+# Added by assistant to avoid committing large or local-only files
+downloads/
+logs/
+server/downloads/
+server/logs/
+.local/
+.replit
+netlify-site.zip
+*.zip
