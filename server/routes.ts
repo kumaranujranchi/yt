@@ -167,6 +167,23 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Apply logging middleware to all routes
   app.use(logRequest);
 
+  // Health endpoint to observe tool availability remotely
+  app.get("/api/health", async (_req, res) => {
+    try {
+      const tools = await ensureTools();
+      return res.json({
+        status: tools.ytdlp ? (tools.ffmpeg ? "ok" : "degraded") : "down",
+        hasYtDlp: tools.ytdlp,
+        hasFfmpeg: tools.ffmpeg,
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString(),
+      });
+    } catch (e) {
+      logger.error("Health check error", { error: e instanceof Error ? e.message : String(e) });
+      return res.json({ status: "error", message: "health check failed" });
+    }
+  });
+
   // Get video info from YouTube URL
   app.post("/api/video-info", async (req, res) => {
     try {
