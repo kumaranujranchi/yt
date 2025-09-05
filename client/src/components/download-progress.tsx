@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Card, CardContent } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { useEffect } from "react";
+import type { Download } from "@shared/schema";
 
 interface DownloadProgressProps {
   downloadId: string;
@@ -9,7 +10,7 @@ interface DownloadProgressProps {
 }
 
 export default function DownloadProgress({ downloadId, onComplete }: DownloadProgressProps) {
-  const { data: download, isLoading } = useQuery({
+  const { data: download, isLoading } = useQuery<Download | null>({
     queryKey: ["/api/downloads", downloadId],
     refetchInterval: 1000, // Poll every second
     enabled: !!downloadId,

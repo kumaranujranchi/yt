@@ -8,6 +8,26 @@ import fs from "fs";
 import { logger } from "./utils/logger";
 import { ValidationError, DownloadError, NotFoundError, errorHandler } from "./utils/errors";
 
+// Add preflight binary checks
+let HAS_YTDLP = false;
+let HAS_FFMPEG = false;
+
+async function checkBinaryExists(cmd: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      const p = spawn(cmd, ["--version"]);
+      const timer = setTimeout(() => {
+        try { p.kill(); } catch {}
+        resolve(false);
+      }, 4000);
+      p.on("error", () => { clearTimeout(timer); resolve(false); });
+      p.on("close", (code) => { clearTimeout(timer); resolve(code === 0); });
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
 // Request logging middleware
 const logRequest = (req: any, _res: any, next: any) => {
   logger.info(`${req.method} ${req.path}`, { 
@@ -54,6 +74,12 @@ async function getVideoInfo(url: string): Promise<any | null> {
 
     ytDlp.stderr.on("data", (data) => {
       error += data.toString();
+    });
+
+    // NEW: handle spawn error (e.g., ENOENT when yt-dlp is missing)
+    ytDlp.on("error", (err) => {
+      logger.error("yt-dlp spawn error", { error: err instanceof Error ? err.message : String(err) });
+      resolve({ success: false, errorType: "missing_binary", message: "yt-dlp is not available on the server." });
     });
 
     ytDlp.on("close", (code) => {
@@ -115,6 +141,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
     logger.info("Created logs directory", { path: logsDir });
   }
 
+  // Preflight: check for required binaries at startup
+  HAS_YTDLP = await checkBinaryExists("yt-dlp");
+  HAS_FFMPEG = await checkBinaryExists("ffmpeg");
+  if (!HAS_YTDLP) {
+    logger.error("yt-dlp binary not found. Ensure it is installed and on PATH.");
+  }
+  if (!HAS_FFMPEG) {
+    logger.warn("ffmpeg binary not found. Audio extraction and merging will fail.");
+  }
+
   // Apply logging middleware to all routes
   app.use(logRequest);
 
@@ -133,69 +169,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ message: "Invalid YouTube URL" });
       }
 
-      // Use yt-dlp to get video info (avoid probing formats to prevent 403 on Shorts)
-      const ytDlp = spawn("yt-dlp", [
-        "--dump-json",
-        "--no-download",
-        "--no-check-formats",
-        "-i",
-        "--force-ipv4",
-        "--geo-bypass",
-        "--no-warnings",
-        url
-      ]);
+      // Preflight
+      if (!HAS_YTDLP) {
+        return res.status(503).json({ message: "Server tools are initializing or missing (yt-dlp). Please try again shortly." });
+      }
 
-      let output = "";
-      let error = "";
+      const infoResult = await getVideoInfo(url);
+      if (!infoResult || (infoResult as any).success !== true) {
+        const message = (infoResult as any)?.message ?? "Failed to get video information";
+        const errorType = (infoResult as any)?.errorType ?? "unknown";
+        return res.status(400).json({ message, errorType });
+      }
 
-      ytDlp.stdout.on("data", (data) => {
-        output += data.toString();
-      });
-
-      ytDlp.stderr.on("data", (data) => {
-        error += data.toString();
-      });
-
-      ytDlp.on("close", (code) => {
-        if (code !== 0 && !output) {
-          console.error("yt-dlp error:", error);
-          
-          // Provide more specific error messages based on yt-dlp output
-          let errorMessage = "Failed to fetch video information";
-          
-          if (error.includes("HTTP Error 403")) {
-            errorMessage = "YouTube blocked format probing. Please try again or choose a different quality.";
-          } else if (error.includes("Video unavailable")) {
-            errorMessage = "This video is unavailable. It may have been deleted, made private, or restricted in your region.";
-          } else if (error.includes("Private video")) {
-            errorMessage = "This video is private and cannot be accessed.";
-          } else if (error.includes("This video is not available")) {
-            errorMessage = "This video is not available in your region or has been removed.";
-          } else if (error.includes("Sign in to confirm your age")) {
-            errorMessage = "This video requires age verification and cannot be downloaded.";
-          } else if (error.includes("This video has been removed")) {
-            errorMessage = "This video has been removed by the uploader or YouTube.";
-          } else if (error.includes("Invalid URL")) {
-            errorMessage = "The provided URL is not valid or supported.";
-          }
-          
-          return res.status(400).json({ message: errorMessage });
-        }
-
-        try {
-          const videoInfo = JSON.parse(output);
-          res.json({
-            title: videoInfo.title || "Unknown Title",
-            thumbnail: videoInfo.thumbnail || "",
-            duration: formatDuration(videoInfo.duration) || "Unknown",
-            channel: videoInfo.uploader || "Unknown Channel",
-            views: formatViews(videoInfo.view_count) || "Unknown",
-          });
-        } catch (parseError) {
-          console.error("Parse error:", parseError);
-          res.status(500).json({ message: "Failed to parse video information" });
-        }
-      });
+      const videoInfo = (infoResult as any).data;
+      return res.json(videoInfo);
     } catch (error) {
       console.error("Video info error:", error);
       res.status(500).json({ message: "Internal server error" });
@@ -206,6 +193,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.post("/api/download", async (req, res) => {
     try {
       const validatedData = downloadRequestSchema.parse(req.body);
+
+      // Preflight: ensure tools exist
+      if (!HAS_YTDLP || !HAS_FFMPEG) {
+        return res.status(503).json({ message: "Server tools are initializing or missing (yt-dlp/ffmpeg). Please try again shortly." });
+      }
       
       // First get video info
       const { url, quality, format } = validatedData;
