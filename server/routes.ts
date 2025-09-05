@@ -38,6 +38,19 @@ const logRequest = (req: any, _res: any, next: any) => {
   next();
 };
 
+// Dynamically re-check tools when missing to allow self-heal without restart
+async function ensureTools(): Promise<{ ytdlp: boolean; ffmpeg: boolean }> {
+  if (!HAS_YTDLP) {
+    HAS_YTDLP = await checkBinaryExists("yt-dlp");
+    if (HAS_YTDLP) logger.info("yt-dlp is now available after re-check");
+  }
+  if (!HAS_FFMPEG) {
+    HAS_FFMPEG = await checkBinaryExists("ffmpeg");
+    if (HAS_FFMPEG) logger.info("ffmpeg is now available after re-check");
+  }
+  return { ytdlp: HAS_YTDLP, ffmpeg: HAS_FFMPEG };
+}
+
 // Extract video info logic into reusable function
 async function getVideoInfo(url: string): Promise<any | null> {
   return new Promise((resolve) => {
@@ -169,8 +182,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ message: "Invalid YouTube URL" });
       }
 
-      // Preflight
-      if (!HAS_YTDLP) {
+      // Preflight (with dynamic re-check)
+      const tools = await ensureTools();
+      if (!tools.ytdlp) {
         return res.status(503).json({ message: "Server tools are initializing or missing (yt-dlp). Please try again shortly." });
       }
 
@@ -194,8 +208,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const validatedData = downloadRequestSchema.parse(req.body);
 
-      // Preflight: ensure tools exist
-      if (!HAS_YTDLP || !HAS_FFMPEG) {
+      // Preflight: ensure tools exist (with dynamic re-check)
+      const tools = await ensureTools();
+      if (!tools.ytdlp || !tools.ffmpeg) {
         return res.status(503).json({ message: "Server tools are initializing or missing (yt-dlp/ffmpeg). Please try again shortly." });
       }
       
