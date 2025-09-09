@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Card, CardContent } from "@/components/ui/card";
-import { Download, Link } from "lucide-react";
+import { Download, Link, Search } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { apiRequest } from "@/lib/queryClient";
 
@@ -29,6 +29,7 @@ interface DownloadFormProps {
 
 export default function DownloadForm({ onVideoInfo, onDownloadStart }: DownloadFormProps) {
   const [isLoading, setIsLoading] = useState(false);
+  const [isGettingInfo, setIsGettingInfo] = useState(false);
   const [urlError, setUrlError] = useState("");
   const { toast } = useToast();
 
@@ -51,7 +52,38 @@ export default function DownloadForm({ onVideoInfo, onDownloadStart }: DownloadF
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to fetch video information";
       setUrlError(message);
+      onVideoInfo(null); // Clear any previous video info
       throw error;
+    }
+  };
+
+  const handleGetInfoOnly = async () => {
+    const url = form.getValues("url");
+    
+    // Validate URL first
+    const result = formSchema.pick({ url: true }).safeParse({ url });
+    if (!result.success) {
+      setUrlError(result.error.errors[0]?.message || "Please enter a valid YouTube URL");
+      return;
+    }
+
+    setIsGettingInfo(true);
+    setUrlError("");
+
+    try {
+      await handleGetVideoInfo(url);
+      toast({
+        title: "Video Info Retrieved",
+        description: "Video information has been loaded successfully.",
+      });
+    } catch (error) {
+      toast({
+        title: "Failed to Get Video Info",
+        description: error instanceof Error ? error.message : "Please check the URL and try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsGettingInfo(false);
     }
   };
 
@@ -101,18 +133,31 @@ export default function DownloadForm({ onVideoInfo, onDownloadStart }: DownloadF
             <Label htmlFor="url" className="text-sm font-medium text-foreground">
               YouTube URL
             </Label>
-            <div className="relative">
-              <Input
-                {...form.register("url")}
-                id="url"
-                type="url"
-                placeholder="https://www.youtube.com/watch?v=..."
-                className="url-input pl-4 pr-12"
-                data-testid="input-youtube-url"
-              />
-              <div className="absolute inset-y-0 right-0 pr-3 flex items-center">
-                <Link className="text-muted-foreground h-5 w-5" />
+            <div className="flex gap-2">
+              <div className="relative flex-1">
+                <Input
+                  {...form.register("url")}
+                  id="url"
+                  type="url"
+                  placeholder="https://www.youtube.com/watch?v=..."
+                  className="url-input pl-4 pr-12"
+                  data-testid="input-youtube-url"
+                />
+                <div className="absolute inset-y-0 right-0 pr-3 flex items-center">
+                  <Link className="text-muted-foreground h-5 w-5" />
+                </div>
               </div>
+              <Button 
+                type="button"
+                variant="outline"
+                onClick={handleGetInfoOnly}
+                disabled={isGettingInfo || isLoading}
+                className="px-4"
+                data-testid="button-get-video-info"
+              >
+                <Search className="h-4 w-4 mr-2" />
+                {isGettingInfo ? "Getting..." : "Preview"}
+              </Button>
             </div>
             {(form.formState.errors.url || urlError) && (
               <p className="text-sm text-destructive" data-testid="text-url-error">
