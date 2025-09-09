@@ -1,4 +1,4 @@
-import type { Express } from "express";
+import type { Express, Request, Response, NextFunction } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { downloadRequestSchema, insertDownloadSchema } from "@shared/schema";
@@ -7,10 +7,85 @@ import path from "path";
 import fs from "fs";
 import { logger } from "./utils/logger";
 import { ValidationError, DownloadError, NotFoundError, errorHandler } from "./utils/errors";
+import https from "https";
 
 // Add preflight binary checks
 let HAS_YTDLP = false;
 let HAS_FFMPEG = false;
+
+// Resolve yt-dlp command with self-healing local download fallback (for Replit Deployments etc)
+const BIN_DIR = path.join(process.cwd(), "bin");
+const YT_DLP_LOCAL = path.join(BIN_DIR, process.platform === "darwin" ? "yt-dlp_macos" : "yt-dlp");
+let YT_DLP_CMD = "yt-dlp"; // default to global
+
+function ensureDir(p: string) {
+  try { fs.mkdirSync(p, { recursive: true }); } catch {}
+}
+
+async function downloadFile(url: string, dest: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const file = fs.createWriteStream(dest);
+    https.get(url, (response) => {
+      if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+        // handle redirect
+        file.close();
+        fs.unlink(dest, () => {});
+        downloadFile(response.headers.location!, dest).then(resolve).catch(reject);
+        return;
+      }
+      if (!response.statusCode || response.statusCode >= 400) {
+        file.close();
+        fs.unlink(dest, () => {});
+        reject(new Error(`Download failed with status ${response.statusCode}`));
+        return;
+      }
+      response.pipe(file);
+      file.on("finish", () => file.close(() => resolve()));
+      file.on("error", (err) => { try { file.close(); } catch {} fs.unlink(dest, () => {}); reject(err); });
+    }).on("error", (err) => {
+      try { file.close(); } catch {}
+      fs.unlink(dest, () => {});
+      reject(err);
+    });
+  });
+}
+
+async function ensureYtDlpBinary(): Promise<boolean> {
+  // If a local binary exists, prefer it
+  if (fs.existsSync(YT_DLP_LOCAL)) {
+    try { fs.chmodSync(YT_DLP_LOCAL, 0o755); } catch {}
+    YT_DLP_CMD = YT_DLP_LOCAL;
+    return true;
+  }
+
+  // If global exists, use it
+  if (await checkBinaryExists("yt-dlp")) {
+    YT_DLP_CMD = "yt-dlp";
+    return true;
+  }
+
+  // Attempt to download latest yt-dlp release binary at runtime (helps in Replit Deployments)
+  try {
+    ensureDir(BIN_DIR);
+    const isLinux = process.platform === "linux";
+    const isDarwin = process.platform === "darwin";
+    const url = isLinux
+      ? "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
+      : isDarwin
+        ? "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos"
+        : "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"; // fallback
+
+    logger.warn("yt-dlp not found. Attempting runtime download…", { url });
+    await downloadFile(url, YT_DLP_LOCAL);
+    try { fs.chmodSync(YT_DLP_LOCAL, 0o755); } catch {}
+    YT_DLP_CMD = YT_DLP_LOCAL;
+    logger.info("yt-dlp downloaded successfully", { path: YT_DLP_LOCAL });
+    return true;
+  } catch (e) {
+    logger.error("Failed to download yt-dlp", { error: e instanceof Error ? e.message : String(e) });
+    return false;
+  }
+}
 
 async function checkBinaryExists(cmd: string): Promise<boolean> {
   return new Promise((resolve) => {
@@ -26,7 +101,7 @@ async function checkBinaryExists(cmd: string): Promise<boolean> {
       
       p.on("error", (err) => { 
         clearTimeout(timer); 
-        logger.debug(`Binary check error for ${cmd}:`, { error: err.message });
+        logger.debug(`Binary check error for ${cmd}:`, { error: (err as any).message });
         resolve(false); 
       });
       
@@ -44,11 +119,11 @@ async function checkBinaryExists(cmd: string): Promise<boolean> {
 }
 
 // Request logging middleware
-const logRequest = (req: any, _res: any, next: any) => {
+const logRequest = (req: Request, _res: Response, next: NextFunction) => {
   logger.info(`${req.method} ${req.path}`, { 
     ip: req.ip, 
     userAgent: req.get('User-Agent'),
-    body: req.method !== 'GET' ? req.body : undefined
+    body: req.method !== 'GET' ? (req as any).body : undefined
   });
   next();
 };
@@ -56,8 +131,9 @@ const logRequest = (req: any, _res: any, next: any) => {
 // Dynamically re-check tools when missing to allow self-heal without restart
 async function ensureTools(): Promise<{ ytdlp: boolean; ffmpeg: boolean }> {
   if (!HAS_YTDLP) {
-    HAS_YTDLP = await checkBinaryExists("yt-dlp");
-    if (HAS_YTDLP) logger.info("yt-dlp is now available after re-check");
+    // Try global, then local download
+    HAS_YTDLP = (await ensureYtDlpBinary());
+    if (HAS_YTDLP) logger.info("yt-dlp is available");
   }
   if (!HAS_FFMPEG) {
     HAS_FFMPEG = await checkBinaryExists("ffmpeg");
@@ -82,7 +158,7 @@ async function getVideoInfo(url: string): Promise<any | null> {
     }
 
     // Use yt-dlp to get video info (avoid probing formats to prevent 403 on Shorts)
-    const ytDlp = spawn("yt-dlp", [
+    const ytDlp = spawn(YT_DLP_CMD, [
       "--dump-json",
       "--no-download",
       "--no-check-formats",
@@ -90,27 +166,28 @@ async function getVideoInfo(url: string): Promise<any | null> {
       "--force-ipv4",
       "--geo-bypass",
       "--no-warnings",
+      "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       url
     ]);
 
     let output = "";
     let error = "";
 
-    ytDlp.stdout.on("data", (data) => {
+    ytDlp.stdout.on("data", (data: any) => {
       output += data.toString();
     });
 
-    ytDlp.stderr.on("data", (data) => {
+    ytDlp.stderr.on("data", (data: any) => {
       error += data.toString();
     });
 
     // NEW: handle spawn error (e.g., ENOENT when yt-dlp is missing)
-    ytDlp.on("error", (err) => {
+    ytDlp.on("error", (err: any) => {
       logger.error("yt-dlp spawn error", { error: err instanceof Error ? err.message : String(err) });
       resolve({ success: false, errorType: "missing_binary", message: "yt-dlp is not available on the server." });
     });
 
-    ytDlp.on("close", (code) => {
+    ytDlp.on("close", (code: any) => {
       if (code !== 0 && !output) {
         // Log more specific error information
         let errorType = "unknown";
@@ -170,7 +247,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   }
 
   // Preflight: check for required binaries at startup
-  HAS_YTDLP = await checkBinaryExists("yt-dlp");
+  HAS_YTDLP = await ensureYtDlpBinary();
   HAS_FFMPEG = await checkBinaryExists("ffmpeg");
   if (!HAS_YTDLP) {
     logger.error("yt-dlp binary not found. Ensure it is installed and on PATH.");
@@ -202,7 +279,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Get video info from YouTube URL
   app.post("/api/video-info", async (req, res) => {
     try {
-      const { url } = req.body;
+      const { url } = (req as any).body;
       
       if (!url || typeof url !== "string") {
         return res.status(400).json({ message: "URL is required" });
@@ -445,6 +522,8 @@ async function processDownload(downloadId: string) {
     }
 
     const args = [
+      "--force-ipv4", "--geo-bypass", "--no-warnings",
+      "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       "--format", formatString,
       "--output", outputPath,
       downloadUrl
@@ -462,7 +541,7 @@ async function processDownload(downloadId: string) {
       args.push("--extract-audio", "--audio-format", "wav");
     }
 
-    const ytDlp = spawn("yt-dlp", args);
+    const ytDlp = spawn(YT_DLP_CMD, args);
 
     let error = "";
     let lastProgress = 0;
@@ -546,17 +625,18 @@ async function estimateFileSize(videoUrl: string, videoQuality: string, videoFor
         "--force-ipv4",
         "--geo-bypass",
         "--no-warnings",
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         videoUrl
       ];
 
-      const ytDlp = spawn("yt-dlp", args);
+      const ytDlp = spawn(YT_DLP_CMD, args);
       let output = "";
 
-      ytDlp.stdout.on("data", (data) => {
+      ytDlp.stdout.on("data", (data: any) => {
         output += data.toString();
       });
 
-      ytDlp.on("close", (code) => {
+      ytDlp.on("close", (code: any) => {
         if (code === 0 || output) {
           try {
             const info = JSON.parse(output);
@@ -617,5 +697,5 @@ function formatViews(views: number): string {
 }
 
 function sanitizeFilename(filename: string): string {
-  return filename.replace(/[^a-zA-Z0-9 \-_\.]/g, "").substring(0, 100);
+  return filename.replace(/[^a-zA-Z0-9 \-_.]/g, "").substring(0, 100);
 }

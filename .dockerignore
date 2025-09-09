@@ -1,0 +1,24 @@
+node_modules
+client/node_modules
+npm-debug.log
+.yarn
+.pnpm-store
+
+# Build outputs
+/dist
+/downloads
+/logs
+/bin
+
+# Git & CI
+.git
+.github
+.gitattributes
+.gitignore
+
+# OS
+**/.DS_Store
+
+# Misc
+attached_assets
+replit.*
