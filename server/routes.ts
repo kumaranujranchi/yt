@@ -246,21 +246,34 @@ export async function registerRoutes(app: Express): Promise<Server> {
     logger.info("Created logs directory", { path: logsDir });
   }
 
-  // Preflight: check for required binaries at startup
-  HAS_YTDLP = await ensureYtDlpBinary();
-  HAS_FFMPEG = await checkBinaryExists("ffmpeg");
-  if (!HAS_YTDLP) {
-    logger.error("yt-dlp binary not found. Ensure it is installed and on PATH.");
-  }
-  if (!HAS_FFMPEG) {
-    logger.warn("ffmpeg binary not found. Audio extraction and merging will fail.");
-  }
+  // Preflight: check for required binaries at startup (non-blocking)
+  setImmediate(async () => {
+    HAS_YTDLP = await ensureYtDlpBinary();
+    HAS_FFMPEG = await checkBinaryExists("ffmpeg");
+    if (!HAS_YTDLP) {
+      logger.error("yt-dlp binary not found. Ensure it is installed and on PATH.");
+    }
+    if (!HAS_FFMPEG) {
+      logger.warn("ffmpeg binary not found. Audio extraction and merging will fail.");
+    }
+  });
 
   // Apply logging middleware to all routes
   app.use(logRequest);
 
-  // Health endpoint to observe tool availability remotely
-  app.get("/api/health", async (_req, res) => {
+  // Liveness health endpoint: must be fast and always 200
+  app.get("/api/health", (_req, res) => {
+    return res.json({
+      status: "ok",
+      hasYtDlp: HAS_YTDLP,
+      hasFfmpeg: HAS_FFMPEG,
+      uptime: process.uptime(),
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  // Readiness/status endpoint which can attempt to self-heal
+  app.get("/api/status", async (_req, res) => {
     try {
       const tools = await ensureTools();
       return res.json({
@@ -271,8 +284,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         timestamp: new Date().toISOString(),
       });
     } catch (e) {
-      logger.error("Health check error", { error: e instanceof Error ? e.message : String(e) });
-      return res.json({ status: "error", message: "health check failed" });
+      logger.error("Status check error", { error: e instanceof Error ? e.message : String(e) });
+      return res.json({ status: "error", message: "status check failed" });
     }
   });
 
@@ -651,12 +664,9 @@ async function estimateFileSize(videoUrl: string, videoQuality: string, videoFor
               }
             });
 
-            if (!targetFormat && info.formats?.length > 0) {
-              targetFormat = info.formats[info.formats.length - 1];
-            }
-
-            resolve(targetFormat?.filesize || info.filesize_approx || null);
-          } catch (e) {
+            const size = targetFormat?.filesize || targetFormat?.filesize_approx || null;
+            resolve(size ?? null);
+          } catch {
             resolve(null);
           }
         } else {
@@ -664,38 +674,30 @@ async function estimateFileSize(videoUrl: string, videoQuality: string, videoFor
         }
       });
 
-      ytDlp.on("error", () => {
-        resolve(null);
-      });
+      ytDlp.on("error", () => resolve(null));
     });
-  } catch (error) {
+  } catch {
     return null;
   }
 }
 
 function formatDuration(seconds: number): string {
-  if (!seconds) return "Unknown";
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  const secs = seconds % 60;
-  
-  if (hours > 0) {
-    return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-  }
-  return `${minutes}:${secs.toString().padStart(2, '0')}`;
+  if (!seconds || Number.isNaN(seconds)) return "Unknown";
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  return [h, m, s]
+    .map((v, i) => (i === 0 ? v.toString() : v.toString().padStart(2, '0')))
+    .filter((v, i) => v !== '0' || i > 0)
+    .join(':');
 }
 
 function formatViews(views: number): string {
-  if (!views) return "Unknown";
-  if (views >= 1000000) {
-    return `${(views / 1000000).toFixed(1)}M`;
-  }
-  if (views >= 1000) {
-    return `${(views / 1000).toFixed(1)}K`;
-  }
-  return views.toString();
+  if (!views || Number.isNaN(views)) return "Unknown";
+  const formatter = new Intl.NumberFormat('en', { notation: 'compact' as any });
+  return formatter.format(views);
 }
 
 function sanitizeFilename(filename: string): string {
-  return filename.replace(/[^a-zA-Z0-9 \-_.]/g, "").substring(0, 100);
+  return filename.replace(/[^a-z0-9-_\.\s]/gi, "_").substring(0, 200);
 }

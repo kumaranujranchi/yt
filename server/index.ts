@@ -11,10 +11,10 @@ app.use((req, res, next) => {
   const path = req.path;
   let capturedJsonResponse: Record<string, any> | undefined = undefined;
 
-  const originalResJson = res.json;
-  res.json = function (bodyJson, ...args) {
-    capturedJsonResponse = bodyJson;
-    return originalResJson.apply(res, [bodyJson, ...args]);
+  const originalResJson = res.json.bind(res) as (body?: any) => Response;
+  (res as any).json = (bodyJson?: any): Response => {
+    capturedJsonResponse = bodyJson as any;
+    return originalResJson(bodyJson);
   };
 
   res.on("finish", () => {
@@ -22,7 +22,9 @@ app.use((req, res, next) => {
     if (path.startsWith("/api")) {
       let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
       if (capturedJsonResponse) {
-        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+        try {
+          logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+        } catch {}
       }
 
       if (logLine.length > 80) {
@@ -61,7 +63,8 @@ app.use((req, res, next) => {
   // this serves both the API and the client.
   // It is the only port that is not firewalled.
   const port = parseInt(process.env.PORT || '5000', 10);
-  server.listen(port, () => {
-    log(`serving on http://localhost:${port}`);
+  // Bind explicitly to 0.0.0.0 for platforms like Railway
+  server.listen(port, "0.0.0.0", () => {
+    log(`serving on http://0.0.0.0:${port}`);
   });
 })();
