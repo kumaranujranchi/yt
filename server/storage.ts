@@ -148,8 +148,20 @@ class MemStorage implements IStorage {
   }
 }
 
-// Force in-memory storage only (no database)
-const storageInstance: IStorage = new MemStorage();
-console.log("✅ Using in-memory storage (server-side only, no database)");
+// Use database storage if DATABASE_URL is available, otherwise fall back to memory storage
+let storageInstance: IStorage;
+try {
+  const connectionString = process.env.DATABASE_URL || process.env.NEON_DATABASE_URL;
+  if (connectionString) {
+    storageInstance = new DatabaseStorage();
+    console.log("✅ Using database storage (PostgreSQL with Neon)");
+  } else {
+    storageInstance = new MemStorage();
+    console.log("✅ Using in-memory storage (no DATABASE_URL provided)");
+  }
+} catch (error) {
+  console.warn("⚠️ Database connection failed, falling back to in-memory storage:", error);
+  storageInstance = new MemStorage();
+}
 
 export const storage = storageInstance;
