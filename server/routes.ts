@@ -262,15 +262,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.use(logRequest);
 
   // Liveness health endpoint: must be fast and always 200
-  app.get("/api/health", (_req, res) => {
-    return res.json({
-      status: "ok",
-      hasYtDlp: HAS_YTDLP,
-      hasFfmpeg: HAS_FFMPEG,
-      uptime: process.uptime(),
-      timestamp: new Date().toISOString(),
-    });
-  });
+  // MOVED TO server/index.ts TO BE AVAILABLE IMMEDIATELY
+  // app.get("/api/health", (_req, res) => {
+  //   return res.json({
+  //     status: "ok",
+  //     hasYtDlp: HAS_YTDLP,
+  //     hasFfmpeg: HAS_FFMPEG,
+  //     uptime: process.uptime(),
+  //     timestamp: new Date().toISOString(),
+  //   });
+  // });
 
   // Readiness/status endpoint which can attempt to self-heal
   app.get("/api/status", async (_req, res) => {

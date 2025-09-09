@@ -3,6 +3,12 @@ import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
 
 const app = express();
+
+// Lightweight liveness probe for Railway healthchecks
+app.get("/api/health", (_req, res) => {
+  res.status(200).json({ status: "ok" });
+});
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
