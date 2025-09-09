@@ -15,14 +15,29 @@ let HAS_FFMPEG = false;
 async function checkBinaryExists(cmd: string): Promise<boolean> {
   return new Promise((resolve) => {
     try {
-      const p = spawn(cmd, ["--version"]);
+      const p = spawn(cmd, ["--version"], { stdio: 'pipe' });
       const timer = setTimeout(() => {
-        try { p.kill(); } catch {}
+        try { p.kill('SIGTERM'); } catch {}
         resolve(false);
-      }, 4000);
-      p.on("error", () => { clearTimeout(timer); resolve(false); });
-      p.on("close", (code) => { clearTimeout(timer); resolve(code === 0); });
-    } catch {
+      }, 6000);
+      
+      let hasOutput = false;
+      p.stdout?.on('data', () => { hasOutput = true; });
+      
+      p.on("error", (err) => { 
+        clearTimeout(timer); 
+        logger.debug(`Binary check error for ${cmd}:`, { error: err.message });
+        resolve(false); 
+      });
+      
+      p.on("close", (code) => { 
+        clearTimeout(timer); 
+        const success = code === 0 || hasOutput;
+        logger.debug(`Binary check for ${cmd}:`, { code, hasOutput, success });
+        resolve(success); 
+      });
+    } catch (err) {
+      logger.debug(`Binary check exception for ${cmd}:`, { error: err instanceof Error ? err.message : String(err) });
       resolve(false);
     }
   });
@@ -225,14 +240,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const validatedData = downloadRequestSchema.parse(req.body);
 
-      // Preflight: ensure tools exist (with dynamic re-check)
-      const tools = await ensureTools();
-      if (!tools.ytdlp || !tools.ffmpeg) {
-        return res.status(503).json({ message: "Server tools are initializing or missing (yt-dlp/ffmpeg). Please try again shortly." });
-      }
-      
       // First get video info
       const { url, quality, format } = validatedData;
+      
+      // Preflight: ensure tools exist (with dynamic re-check)
+      const tools = await ensureTools();
+      if (!tools.ytdlp) {
+        return res.status(503).json({ message: "Server tools are initializing or missing (yt-dlp). Please try again shortly." });
+      }
+      
+      // Check if ffmpeg is required for this specific download
+      const requiresFFmpeg = format === "mp3" || format === "wav";
+      if (requiresFFmpeg && !tools.ffmpeg) {
+        return res.status(503).json({ message: "FFmpeg is required for audio downloads but not available. Please try a video format instead." });
+      }
       
       // Get video info directly instead of making a self-referencing fetch
       const infoResult = await getVideoInfo(url);
@@ -353,7 +374,7 @@ let isProcessing = false;
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 5000; // 5 seconds
 
-async function startDownload(downloadId: string, url: string, quality: string, format: string, filename: string) {
+async function startDownload(downloadId: string, downloadUrl: string, downloadQuality: string, downloadFormat: string, filename: string) {
   // Add to queue instead of starting immediately
   downloadQueue.push(downloadId);
   logger.info("Download queued", { downloadId, queueLength: downloadQueue.length });
@@ -391,7 +412,7 @@ async function processDownload(downloadId: string) {
     return;
   }
 
-  const { url, quality, format, filename } = download;
+  const { url: downloadUrl, quality: downloadQuality, format: downloadFormat, filename } = download;
   
   try {
     const downloadsDir = path.join(process.cwd(), "downloads");
@@ -404,40 +425,40 @@ async function processDownload(downloadId: string) {
     });
 
     // Estimate file size before download
-    const estimatedSize = await estimateFileSize(url, quality, format);
+    const estimatedSize = await estimateFileSize(downloadUrl, downloadQuality, downloadFormat);
     if (estimatedSize) {
       await storage.updateDownload(downloadId, { fileSize: estimatedSize });
     }
 
     // Determine yt-dlp format string
     let formatString = "best";
-    if (format === "mp3") {
+    if (downloadFormat === "mp3") {
       formatString = "bestaudio/best";
-    } else if (format === "wav") {
+    } else if (downloadFormat === "wav") {
       formatString = "bestaudio/best";
     } else {
       // Video formats: prefer separate video+audio with fallback to single-file best
-      if (quality === "1080p") formatString = "bestvideo[height<=1080]+bestaudio/best[height<=1080]";
-      else if (quality === "720p") formatString = "bestvideo[height<=720]+bestaudio/best[height<=720]";
-      else if (quality === "480p") formatString = "bestvideo[height<=480]+bestaudio/best[height<=480]";
-      else if (quality === "360p") formatString = "bestvideo[height<=360]+bestaudio/best[height<=360]";
+      if (downloadQuality === "1080p") formatString = "bestvideo[height<=1080]+bestaudio/best[height<=1080]";
+      else if (downloadQuality === "720p") formatString = "bestvideo[height<=720]+bestaudio/best[height<=720]";
+      else if (downloadQuality === "480p") formatString = "bestvideo[height<=480]+bestaudio/best[height<=480]";
+      else if (downloadQuality === "360p") formatString = "bestvideo[height<=360]+bestaudio/best[height<=360]";
     }
 
     const args = [
       "--format", formatString,
       "--output", outputPath,
-      url
+      downloadUrl
     ];
 
     // For video outputs, ensure merged container matches requested format when possible
-    if (format === "mp4" || format === "webm") {
-      args.push("--merge-output-format", format);
+    if (downloadFormat === "mp4" || downloadFormat === "webm") {
+      args.push("--merge-output-format", downloadFormat);
     }
 
     // Add audio extraction for audio-only formats
-    if (format === "mp3") {
+    if (downloadFormat === "mp3") {
       args.push("--extract-audio", "--audio-format", "mp3");
-    } else if (format === "wav") {
+    } else if (downloadFormat === "wav") {
       args.push("--extract-audio", "--audio-format", "wav");
     }
 
@@ -514,7 +535,7 @@ async function processDownload(downloadId: string) {
   }
 }
 
-async function estimateFileSize(url: string, quality: string, format: string): Promise<number | null> {
+async function estimateFileSize(videoUrl: string, videoQuality: string, videoFormat: string): Promise<number | null> {
   try {
     return new Promise((resolve) => {
       const args = [
@@ -525,7 +546,7 @@ async function estimateFileSize(url: string, quality: string, format: string): P
         "--force-ipv4",
         "--geo-bypass",
         "--no-warnings",
-        url
+        videoUrl
       ];
 
       const ytDlp = spawn("yt-dlp", args);
@@ -542,10 +563,10 @@ async function estimateFileSize(url: string, quality: string, format: string): P
             
             // Find appropriate format
             let targetFormat = info.formats?.find((f: any) => {
-              if (format === "mp3" || format === "wav") {
+              if (videoFormat === "mp3" || videoFormat === "wav") {
                 return f.acodec !== "none" && f.vcodec === "none";
               } else {
-                const heightMatch = f.height?.toString() === quality.replace("p", "");
+                const heightMatch = f.height?.toString() === videoQuality.replace("p", "");
                 return heightMatch && f.acodec !== "none";
               }
             });
